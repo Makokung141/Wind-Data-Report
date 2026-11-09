@@ -38,7 +38,9 @@ if not selected_sites:
 
 # 3. ดึงข้อมูล
 all_months_data = []
+monthly_report_data = []  # สำหรับเก็บข้อมูลไปแสดงรายงานรายเดือน
 target_folder_url = ""
+
 for site in selected_sites:
     print(f"\n📍 เริ่มดึงข้อมูลของ Site: {site}")
     try:
@@ -55,6 +57,7 @@ for site in selected_sites:
                 commissioning_date = pd.to_datetime(
                     commissioning_date_str, format="%d/%m/%Y", errors="coerce"
                 )
+                print(f"   📅 Commissioning Date ของ {site}: {commissioning_date_str}")
             except Exception as date_err:
                 print(
                     f"   => ⚠️ Warning: ไม่สามารถแปลง Commisioning Date"
@@ -93,13 +96,14 @@ for site in selected_sites:
                     gc.open_by_url(url).worksheet(str(tab)).get_all_records()
                 )
 
+                # แทนที่ค่าที่เป็นช่องว่าง ('', ' ', ฯลฯ) ให้เป็น NaN เพื่อไม่ให้นับเป็น Clean Data
+                df_month.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+
                 # Convert 'Timestamp' to datetime early for consistent filtering
                 df_month["Timestamp"] = pd.to_datetime(
                     df_month["Timestamp"], format="%d/%m/%Y, %H:%M:%S", errors="coerce"
                 )
-                df_month = df_month.dropna(
-                    subset=["Timestamp"]
-                )  # Drop rows where Timestamp couldn't be parsed
+                df_month = df_month.dropna(subset=["Timestamp"])
 
                 # Filter df_month by commissioning_date if it's valid
                 if commissioning_date is not None and not pd.isna(commissioning_date):
@@ -116,7 +120,14 @@ for site in selected_sites:
                 if not temp_time.empty:
                     m_name = temp_time.dt.strftime("%B").iloc[0]
                     y_num = temp_time.dt.year.iloc[0]
+                    month_year_str = temp_time.dt.strftime("%B %Y").iloc[0]
+
                     print(f"   => ✅ สำเร็จ! (ข้อมูลที่กำลังดึงคือ: เดือน {m_name} ปี {y_num})")
+
+                    monthly_report_data.append({
+                        "month_year": month_year_str,
+                        "df": df_month.copy()
+                    })
                 else:
                     print(
                         f"   => ✅ สำเร็จ! แต่ไม่พบข้อมูล Timestamp ที่ถูกต้องในชีต {tab}"
@@ -131,11 +142,10 @@ for site in selected_sites:
         print(f"❌ เกิดข้อผิดพลาดกับ Site {site}: {e}")
         continue
 
-# 4. ประมวลผล
+# 4. ประมวลผลภาพรวม
 if not all_months_data:
     raise ValueError(
-        "❌ ไม่พบข้อมูลที่ถูกเลือก กรุณาตรวจสอบให้แน่ใจว่าในชีตย่อยมีแถวที่คอลัมน์"
-        " D ถูกติ๊กถูกอยู่จริงๆ"
+        "❌ ไม่พบข้อมูลที่ถูกเลือก กรุณาตรวจสอบให้แน่ใจว่าในชีตย่อยมีแถวที่คอลัมน์ D ถูกติ๊กถูกอยู่จริงๆ"
     )
 
 df_all_years = pd.concat(all_months_data, ignore_index=True)
@@ -148,50 +158,43 @@ df_all_years = (
     .reset_index(drop=True)
 )
 
-# กรองข้อมูลเอาเฉพาะข้อมูลที่ถึงแค่เวลาปัจจุบัน (ป้องกันข้อมูลอนาคตหลุดมา)
+# กรองข้อมูลเอาเฉพาะข้อมูลที่ถึงแค่เวลาปัจจุบัน
 df_all_years = df_all_years[df_all_years["Timestamp"] <= pd.Timestamp.now()]
 
 # --- หาวันที่เริ่มต้นและสิ้นสุด เพื่อนำไปแสดงผล ---
 start_period = df_all_years["Timestamp"].min().strftime("%b %Y")
 end_period = df_all_years["Timestamp"].max().strftime("%b %Y")
 period_text = (
-    start_period
-    if start_period == end_period
-    else f"{start_period} - {end_period}"
+    start_period if start_period == end_period else f"{start_period} - {end_period}"
 )
+
 print(f"\n=======================================================")
-print(f"📊 สรุป: ข้อมูลทั้งหมดที่นำมาวิเคราะห์คือช่วงเวลา {period_text}")
+print(f"📊 สรุปภาพรวมช่วงเวลาทั้งหมด: {period_text}")
 print(f"=======================================================\n")
-# -----------------------------------------------
 
-sensor_columns = [
-    col for col in df_all_years.columns if col != "Timestamp" and "Avg" in col
-]
+print(f"📋 รายละเอียด % Recovery ของแต่ละ Sensor (แยกตามรายเดือน):")
+print(f"-------------------------------------------------------")
 
-# --- 1. ฟังก์ชัน get_sensor_info ดึงข้อมูลประเภท ความสูง และทิศทาง ---
+# ฟังก์ชันช่วยหา Sensor info (เรียกใช้ซ้ำได้)
 def get_sensor_info(full_name):
     name_upper = full_name.upper()
     stype, height, suffix = "OTHER", 0.0, ""
     try:
-        # ค้นหาความสูงจากตัวเลขที่ตามด้วย m หรือ M
         height_match = re.search(r"(\d+(\.\d+)?)[mM]", full_name)
         if height_match:
             height = float(height_match.group(1))
 
-        # ตรวจสอบประเภทเซ็นเซอร์
         if "ANEM" in name_upper or "WS" in name_upper:
             stype = "WS"
         elif "VANE" in name_upper or "WD" in name_upper:
             stype = "WD"
         elif "RH" in name_upper:
             stype = "RH"
-        # Modified: This is the updated condition for 'P' type sensors
         elif "MB" in name_upper or ("P" in name_upper and not any(s in name_upper for s in ["ANEM", "WS", "VANE", "WD", "RH", "C", "T", "ANALOG"])):
             stype = "P"
         elif "C" in name_upper or "T" in name_upper or "ANALOG" in name_upper:
             stype = "T"
 
-        # ดึงทิศทางหรือ Suffix ท้ายชื่อ (ยกเว้น P, T, RH)
         if stype not in ["P", "T", "RH"]:
             parts = full_name.split("_")
             for part in parts:
@@ -205,30 +208,57 @@ def get_sensor_info(full_name):
         pass
     return stype, height, suffix
 
-# --- 2. ฟังก์ชันจัดกลุ่มเซ็นเซอร์โดยปัดเศษความสูง ---
 def get_base_sensor_key(col_name):
     stype, height, suffix = get_sensor_info(col_name)
-
-    # ถ้าระบุประเภทไม่ได้ (OTHER) ให้ใช้ Fallback ตัดแค่รหัส Channel ออกตามโค้ดเดิม
     if stype == "OTHER":
         cleaned = col_name.strip()
         cleaned = re.sub(r"^(ch\d+|channel\d+|c\d+)[-_.\s]*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"[-_.\s]*(ch\d+|channel\d+|c\d+)$", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"[-_.\s]*(ch|channel|c)$", "", cleaned, flags=re.IGNORECASE)
         return cleaned
-
-    # ถ้าตรวจพบชนิดความสูง ให้ทำการปัดเศษความสูงเป็นจำนวนเต็ม (เช่น 159.80 -> 160)
     rounded_height = int(round(height))
-
-    # สร้าง Key กลางใหม่เพื่อจัดกลุ่ม (เช่น "WS_160m_N")
     key = f"{stype}_{rounded_height}m"
     if suffix:
         key += f"_{suffix}"
-
     return key
 
+# แสดงรายงานรายเดือนตามรูปแบบที่ต้องการ
+for item in monthly_report_data:
+    m_str = item["month_year"]
+    df_m = item["df"]
+    total_rows = len(df_m)
 
-# --- 3. จัดกลุ่มคอลัมน์เซ็นเซอร์ ---
+    print(f"\n📅 เดือน: {m_str} (จำนวนข้อมูลทั้งหมด: {total_rows:,} แถว)")
+
+    m_sensor_cols = [col for col in df_m.columns if col != "Timestamp" and "Avg" in col]
+
+    m_sensor_groups = {}
+    for sensor in m_sensor_cols:
+        b_key = get_base_sensor_key(sensor)
+        if b_key not in m_sensor_groups:
+            m_sensor_groups[b_key] = []
+        m_sensor_groups[b_key].append(sensor)
+
+    for b_key, cols in m_sensor_groups.items():
+        df_v_mat = pd.DataFrame()
+        for col in cols:
+            df_v_mat[col] = pd.to_numeric(df_m[col], errors="coerce").notna().astype(int)
+
+        valid_cnt = df_v_mat.max(axis=1).sum()
+        rec_pct = (valid_cnt / total_rows * 100) if total_rows > 0 else 0.0
+
+        st, h, sfx = get_sensor_info(b_key)
+        sensor_display_name = f"{st}{int(math.ceil(h))}{sfx}"
+
+        print(f"- {sensor_display_name.ljust(10)}   ➔   {rec_pct:5.1f}%   (ใช้งานได้ {valid_cnt:,}/{total_rows:,})")
+
+print("\n" + "="*55 + "\n")
+
+sensor_columns = [
+    col for col in df_all_years.columns if col != "Timestamp" and "Avg" in col
+]
+
+# --- จัดกลุ่มคอลัมน์เซ็นเซอร์ (ภาพรวมทั้งหมด) ---
 sensor_groups = {}
 for sensor in sensor_columns:
     base_key = get_base_sensor_key(sensor)
@@ -240,17 +270,17 @@ sensor_summary = []
 group_stats = {}
 
 for base_key, cols in sensor_groups.items():
-    # สร้าง DataFrame ตรวจสอบความถูกต้องของแต่ละแชนเนลในกลุ่ม
     df_valid_matrix = pd.DataFrame()
     for col in cols:
         df_valid_matrix[col] = (
             pd.to_numeric(df_all_years[col], errors="coerce").notna().astype(int)
         )
 
-    # ใช้ Logical OR (หากแชนเนลใดแชนเนลหนึ่งมีข้อมูลใช้งานได้ จะถือว่าช่วงเวลานั้นใช้งานได้ปกติ)
     combined_stat = df_valid_matrix.max(axis=1).values
     valid_count = combined_stat.sum()
-    recovery = math.ceil((valid_count / len(df_all_years)) * 100)
+
+    # 📌 ปรับเปลี่ยนเป็นการคำนวณ % Recovery ภาพรวมให้เป็นทศนิยม 1 ตำแหน่ง
+    recovery = (valid_count / len(df_all_years) * 100) if len(df_all_years) > 0 else 0.0
 
     sensor_summary.append({"Sensor_Key": base_key, "Recovery": recovery})
     group_stats[base_key] = {"stat": combined_stat, "recovery": recovery}
@@ -282,7 +312,8 @@ for i, row in df_summary.iterrows():
     yticks.append(y)
 
     st, h, sfx = get_sensor_info(row["Sensor_Key"])
-    name = f"{st}{int(math.ceil(h))}{sfx} [{row['Recovery']:.2f}%]"
+    # 📌 แสดงผลค่า % Recovery เป็นทศนิยม 1 ตำแหน่งบนแกน Y ของกราฟ
+    name = f"{st}{int(math.ceil(h))}{sfx} [{row['Recovery']:.1f}%]"
     ylabels.append(name)
 
     stat = group_stats[row["Sensor_Key"]]["stat"]
@@ -311,7 +342,6 @@ for i, row in df_summary.iterrows():
             )
             c_start, c_v = times[j], stat[j]
 
-    # แท่งสุดท้ายของลูป
     dur = (times[-1] - c_start) / np.timedelta64(1, "D")
     y_min, y_height = y - 3.5, 7
 
@@ -330,11 +360,8 @@ for i, row in df_summary.iterrows():
         facecolors=face_color,
     )
 
-# --- ล็อคแกน X ไม่ให้แสดงผลเกินเดือนล่าสุดของข้อมูล ---
 ax.set_xlim([df_all_years["Timestamp"].min(), df_all_years["Timestamp"].max()])
-# ------------------------------------------------
 
-# --- จัดการสีของข้อความและเส้นต่างๆ ให้เป็นสีเข้ม (ตัดกับพื้นขาว) ---
 ax.set_title(
     f"Downtime Plot: {selected_sites[0]} ({period_text})",
     fontsize=24,
@@ -354,7 +381,6 @@ ax.tick_params(axis="y", colors="#333333")
 for spine in ax.spines.values():
     spine.set_edgecolor("#333333")
 
-# --- อัปเดต Legend ---
 ax.legend(
     handles=[
         mpatches.Patch(color="forestgreen", label="Recovery 90-100%"),
@@ -370,7 +396,6 @@ ax.legend(
 )
 
 plt.tight_layout()
-# เปลี่ยนพื้นหลังรูปภาพเป็นสีขาว
 plt.savefig(
     "downtime_plot_output.png",
     bbox_inches="tight",
